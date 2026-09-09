@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Pixel Cleanup</string>
+    <string name="force_clean_short">Force Clean</string>
+    <string name="force_clean_long">Force Pixel Cleanup</string>
+</resources>

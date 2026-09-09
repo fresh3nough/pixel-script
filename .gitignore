@@ -1,0 +1,4 @@
+app/keystore.jks
+app/build/
+.gradle/
+*.idsig

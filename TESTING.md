@@ -1,56 +1,89 @@
-pixel_cleanup.sh - Test Cases
-=============================
+Testing
+=======
 
-Test: Chrome Data Wipe
-----------------------
-1. Start the script when Chrome is running
-2. Verify no cleanup occurs (Chrome data should remain intact)
-3. Close Chrome browser
-4. Re-run the script
-5. Verify Chrome data directory is cleared
-6. Verify Chrome cache is empty
-7. Verify Chrome browser data is wiped
+Prerequisites
+-------------
 
-Test: Google Account Data Wipe
-------------------------------
-1. Start the script with Chrome closed
-2. Verify Google Account data is wiped
-3. Check that /data/data/com.google.android.gms cache is cleared
-4. Check that GMS databases are removed
+- Pixel device authorized over ADB for install/debug only
+- `com.pixel.cleanup` installed
+- Scripts present under `/data/local/tmp/`
 
-Test: Non-Google App Cache Cleanup
-----------------------------------
-1. Set NON_GOOGLE_APPS variable to specific package names
-2. Install test apps if needed
-3. Run the script
-4. Verify cache directories for specified apps are cleared
-5. Verify app data is preserved (pm clear removes all data, use with caution)
+Test Case 1: Chrome close triggers cleanup
+------------------------------------------
 
-Test: Artifacts and Bloat Cleanup
+Steps:
+1. `adb shell am start -n com.pixel.cleanup/.MainActivity`
+2. `adb shell monkey -p com.android.chrome -c android.intent.category.LAUNCHER 1`
+3. Wait until `pidof com.android.chrome` returns a PID
+4. `adb shell am force-stop com.android.chrome`
+5. Wait 8 seconds
+
+Expected:
+- `/data/local/tmp/chrome_monitor.log` contains `Chrome closed transition`
+- `/data/local/tmp/pixel_cleanup.log` contains `cleanup complete`
+- Exit path reports cleanup exit=0
+
+Test Case 2: Force cleanup intent
 ---------------------------------
-1. Create test temporary files in /cache, /data/local/tmp
-2. Run the script
-3. Verify test files are removed
-4. Verify system-critical files are not deleted
 
-Test: Performance Optimization
-------------------------------
-1. Run the script
-2. Verify sync completes successfully
-3. Verify dalvik-cache is cleared (or optimized)
-4. Check that drop_caches command executes without error
+Steps:
+1. `adb shell am start -a com.pixel.cleanup.action.FORCE_CLEANUP -n com.pixel.cleanup/.MainActivity`
+2. Inspect logcat `CleanupRunner`
 
-Test: Script Safety and Exit Codes
------------------------------------
-1. Run the script with no arguments
-2. Verify exit code is 0 on success
-3. Verify error handling for ADB connection failures
-4. Verify the script does not wipe data when Chrome is actively running
+Expected:
+- CleanupRunner logs wipe steps and `cleanup exit=0`
 
-Usage Notes
------------
+Test Case 3: Boot receiver registration
+---------------------------------------
 
-- Test these cases on a real Google Pixel device with ADB access
-- Review and adjust the NON_GOOGLE_APPS variable before running
-- The script is designed to run periodically or on Chrome closure events
-- Backup important data before running, as this wipes Google-related data
+Steps:
+1. `adb shell dumpsys package com.pixel.cleanup | grep BOOT_COMPLETED`
+
+Expected:
+- BootReceiver registered for BOOT_COMPLETED, LOCKED_BOOT_COMPLETED,
+  MY_PACKAGE_REPLACED, USER_UNLOCKED
+
+Test Case 4: Launcher icon
+--------------------------
+
+Steps:
+1. `adb shell cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER com.pixel.cleanup`
+
+Expected:
+- Resolves `com.pixel.cleanup/.MainActivity`
+
+Test Case 5: Service sticky after start
+---------------------------------------
+
+Steps:
+1. Start MainActivity
+2. `adb shell dumpsys activity services com.pixel.cleanup`
+
+Expected:
+- `ChromeMonitorService` isForeground=true
+
+Test Case 6: Update persistence (MY_PACKAGE_REPLACED)
+-----------------------------------------------------
+
+Steps:
+1. Reinstall APK with `adb install -r`
+2. Confirm service running after open or after broadcast
+
+Expected:
+- Monitor service present; app remains launchable
+
+Test Case 7: Cookie preserve path (optional)
+--------------------------------------------
+
+Steps:
+1. Use Chrome while logged into a site
+2. Trigger cleanup with sqlite3 available and readable cookie DB
+
+Expected:
+- Log lines `preserved cookie rows` and restore attempts
+
+Notes
+-----
+
+- `drop_caches` may fail without root; treat as soft failure.
+- App UID may not write shell-owned logs until log file mode is 666.

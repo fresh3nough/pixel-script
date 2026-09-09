@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:shortcutId="force_cleanup"
+        android:enabled="true"
+        android:icon="@drawable/ic_launcher"
+        android:shortcutShortLabel="@string/force_clean_short"
+        android:shortcutLongLabel="@string/force_clean_long">
+        <intent
+            android:action="com.pixel.cleanup.action.FORCE_CLEANUP"
+            android:targetPackage="com.pixel.cleanup"
+            android:targetClass="com.pixel.cleanup.MainActivity" />
+    </shortcut>
+</shortcuts>
