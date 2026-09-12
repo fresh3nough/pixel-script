@@ -16,9 +16,12 @@ Components
    - Battery optimization prompt so monitoring survives Doze
 
 2. `ondevice/pixel_cleanup_ondevice.sh` - native shell cleanup (no host adb)
-   - Preserves one cookie per host when sqlite3 is available
+   - Preserves one cookie per host when sqlite3 is available; falls back to
+     full Cookies DB file copy when sqlite3 is missing
    - Clears Chrome data via `pm clear` (best effort)
    - Clears GMS caches without full account sign-out
+   - Wipes temp dirs, `pm trim-caches` for all apps, and (with root) every
+     `/data/data/*/cache` plus external `Android/data/*/cache`
    - Artifact cleanup and light performance steps
 
 3. `ondevice/chrome_monitor.sh` - shell companion monitor (ADB-free)
@@ -74,10 +77,22 @@ Logs
 Permissions / limits
 --------------------
 
-- Full wipe of other apps' `/data/data` requires root or elevated privileges.
-- Without root, `pm clear com.android.chrome` works for Chrome; GMS is
-  cache-only by design so Google account login is kept.
-- Cookie preserve/restore needs `sqlite3` on device and readable cookie DB.
+Handled automatically by the on-device script:
+
+1. **Other apps' `/data/data`** — full cache wipe uses `su` when rooted.
+   Without root: `pm trim-caches 128G` plus external
+   `/sdcard/Android/data/*/cache` sweeps (no private `/data/data` access).
+2. **Chrome vs GMS** — `pm clear com.android.chrome` clears Chrome. GMS and
+   related Google apps are **cache-only** so the Google account stays signed in.
+3. **Cookies** — prefer `sqlite3` one-cookie-per-host preserve/restore. If
+   `sqlite3` is missing or the DB is unreadable, the full Cookies file is
+   copied aside and restored after wipe (root used when needed to read/write
+   Chrome private storage).
+
+Check privilege mode:
+
+    adb shell sh /data/local/tmp/pixel_cleanup_ondevice.sh --root-status
+
 
 Build APK
 ---------
@@ -92,6 +107,9 @@ Security
 
 - Review NON_GOOGLE_APPS before enabling extra package cache wipes.
 - This tool deletes browser data; keep backups of anything important.
+- GMS is intentionally never `pm clear`'d (account retention).
+- Root is optional; without it only Chrome `pm clear`, trim-caches, public
+  temp dirs, and external app caches are guaranteed.
 
 Contributing
 ------------

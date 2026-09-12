@@ -82,8 +82,50 @@ Steps:
 Expected:
 - Log lines `preserved cookie rows` and restore attempts
 
+Test Case 8: Cookie fallback without sqlite3
+--------------------------------------------
+
+Steps:
+1. Rename/hide sqlite3 on device (or use an image without it)
+2. Ensure Chrome cookie DB exists and is readable (or root available)
+3. `adb shell sh /data/local/tmp/pixel_cleanup_ondevice.sh --force`
+
+Expected:
+- Log contains `falling back to full cookie DB file copy` (or `preserved full cookie DB`)
+- Restore attempts via full DB file path
+
+Test Case 9: All-app cache + temp wipe beyond Chrome
+----------------------------------------------------
+
+Steps:
+1. Create `/data/local/tmp/junk_test.tmp` and a file under
+   `/sdcard/Android/data/com.android.chrome/cache/` if present
+2. Force cleanup
+3. Inspect logs and paths
+
+Expected:
+- Log contains `trim-caches`, `wipe temp dirs`, `all-app cache`
+- `junk_test.tmp` removed; protected files
+  (`pixel_cleanup_ondevice.sh`, `cookies_preserve`, logs, monitor state) kept
+- Without root: external caches cleared; private `/data/data/*/cache` may remain
+- With root (`--root-status` prints `root`): `/data/data/*/cache` swept
+
+Test Case 10: GMS stays signed in
+---------------------------------
+
+Steps:
+1. Confirm a Google account is present (`adb shell dumpsys account`)
+2. Force cleanup
+3. Re-check accounts
+
+Expected:
+- Log shows `wipe GMS caches (not full account sign-out)`
+- No `pm clear com.google.android.gms`
+- Google account still listed after cleanup
+
 Notes
 -----
 
 - `drop_caches` may fail without root; treat as soft failure.
 - App UID may not write shell-owned logs until log file mode is 666.
+- Full private `/data/data` wipes need `su`; non-root uses `pm trim-caches`.

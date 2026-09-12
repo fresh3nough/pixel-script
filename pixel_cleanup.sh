@@ -1,191 +1,247 @@
-#!/system/bin/sh
-# Android data wipe and phone optimization script
-# Performs comprehensive cleanup of Google data, accounts, cache, and phone optimization
-# 
-# IMPORTANT: This script uses adb shell commands and requires ADB connection to device.
-# For ADB-independent execution, install Termux on your Pixel and run the script there.
+#!/bin/sh
+# Host-oriented Android data wipe helper (runs via adb from a workstation).
+# Prefer ondevice/pixel_cleanup_ondevice.sh for ADB-free runtime on device.
 #
-# For auto-execution on Chrome closure: requires Android Java/Kotlin BroadcastReceiver
-# or Termux with Chrome monitoring add-on.
+# Permissions / limits:
+# 1. Full wipe of other apps' /data/data requires root (adb root / su).
+# 2. Chrome: pm clear. GMS: cache-only so Google account login is kept.
+# 3. Cookie preserve/restore needs sqlite3 on device, else full DB file copy.
 
 GOOGLE_CHROME_PACKAGE="com.android.chrome"
 GOOGLE_ACCOUNTS_PACKAGE="com.google.android.gms"
 CHROME_DATA_DIR="/data/data/${GOOGLE_CHROME_PACKAGE}"
+# Modern Chrome cookie paths (tried in order)
+COOKIE_DB_PRIMARY="${CHROME_DATA_DIR}/app_chrome/Default/Network/Cookies"
+COOKIE_DB_SECONDARY="${CHROME_DATA_DIR}/app_chrome/Default/Cookies"
+COOKIE_DB_LEGACY="${CHROME_DATA_DIR}/Default/Cookies"
 GOOGLE_GMS_DIR="/data/data/${GOOGLE_ACCOUNTS_PACKAGE}"
 NON_GOOGLE_APPS=""
+PRESERVE_DIR="/data/local/tmp/cookies_preserve"
+ADB="${ADB:-/system/bin/adb}"
+# Fall back to adb on PATH
+if [ ! -x "$ADB" ]; then
+  ADB=$(command -v adb 2>/dev/null || echo adb)
+fi
 
-# Simple timestamp
-TS() { /system/bin/adb shell "date '+%Y-%m-%d %H:%M:%S'" 2>/dev/null || echo "TIME"; }
+TS() { "$ADB" shell "date '+%Y-%m-%d %H:%M:%S'" 2>/dev/null || date '+%Y-%m-%d %H:%M:%S'; }
 
-# Check if Chrome is running (uses adb, requires ADB connection)
+sh_dev() {
+  "$ADB" shell "$@" 2>/dev/null
+}
+
+have_device_cmd() {
+  sh_dev "command -v $1" >/dev/null 2>&1
+}
+
 is_chrome_running() {
-    /system/bin/adb shell "ps | grep -v grep | grep -q ${GOOGLE_CHROME_PACKAGE}" 2>/dev/null
-    [ $? -eq 0 ]
+  sh_dev "pidof ${GOOGLE_CHROME_PACKAGE}" | grep -q '[0-9]' && return 0
+  sh_dev "ps -A" 2>/dev/null | grep -v grep | grep -q "${GOOGLE_CHROME_PACKAGE}"
 }
 
-# Wipe Chrome data preserving one cookie per domain for login persistence
+find_cookie_db() {
+  for p in "$COOKIE_DB_PRIMARY" "$COOKIE_DB_SECONDARY" "$COOKIE_DB_LEGACY"; do
+    if sh_dev "test -f $p && echo yes" | grep -q yes; then
+      echo "$p"
+      return 0
+    fi
+  done
+  echo ""
+}
+
+preserve_login_cookies() {
+  echo "$(TS) INFO Preserving login cookies..."
+  sh_dev "mkdir -p ${PRESERVE_DIR} && chmod 777 ${PRESERVE_DIR}" || true
+  sh_dev "rm -f ${PRESERVE_DIR}/preserved.tsv ${PRESERVE_DIR}/Cookies.bak ${PRESERVE_DIR}/Cookies-journal.bak" || true
+
+  cdb=$(find_cookie_db)
+  if [ -z "$cdb" ]; then
+    echo "$(TS) INFO no Chrome cookie DB found, skip preserve"
+    return 0
+  fi
+
+  if have_device_cmd sqlite3; then
+    sh_dev "sqlite3 -separator '|' '$cdb' \"SELECT host_key, name, value, expires_utc FROM cookies c WHERE rowid IN (SELECT rowid FROM cookies c2 WHERE c2.host_key = c.host_key ORDER BY last_access_utc DESC LIMIT 1);\" > ${PRESERVE_DIR}/preserved.tsv" || true
+    cnt=$(sh_dev "wc -l < ${PRESERVE_DIR}/preserved.tsv" | tr -d ' \r')
+    if [ -n "$cnt" ] && [ "$cnt" -gt 0 ] 2>/dev/null; then
+      echo "$(TS) INFO Preserved ${cnt} cookies via sqlite3 (one per host)"
+      return 0
+    fi
+    echo "$(TS) WARN sqlite3 preserve empty; falling back to DB file copy"
+  else
+    echo "$(TS) WARN sqlite3 missing on device; falling back to DB file copy"
+  fi
+
+  sh_dev "cp -f '$cdb' ${PRESERVE_DIR}/Cookies.bak" || \
+    sh_dev "su -c 'cp -f \"$cdb\" ${PRESERVE_DIR}/Cookies.bak && chmod 666 ${PRESERVE_DIR}/Cookies.bak'" || true
+  sh_dev "test -f '${cdb}-journal' && cp -f '${cdb}-journal' ${PRESERVE_DIR}/Cookies-journal.bak" || true
+  if sh_dev "test -s ${PRESERVE_DIR}/Cookies.bak && echo yes" | grep -q yes; then
+    echo "$(TS) INFO Preserved full cookie DB file"
+  else
+    echo "$(TS) WARN could not preserve cookie DB"
+  fi
+}
+
+restore_login_cookies() {
+  echo "$(TS) INFO Restoring login cookies..."
+  if sh_dev "test -s ${PRESERVE_DIR}/preserved.tsv && echo yes" | grep -q yes; then
+    if have_device_cmd sqlite3; then
+      cdb=$(find_cookie_db)
+      i=0
+      while [ -z "$cdb" ] && [ "$i" -lt 5 ]; do
+        sleep 1
+        cdb=$(find_cookie_db)
+        i=$((i + 1))
+      done
+      if [ -n "$cdb" ]; then
+        # Stream TSV and insert row by row on device
+        sh_dev "while IFS='|' read -r host name value expiry; do
+          [ -z \"\$host\" ] && continue
+          shost=\$(echo \"\$host\" | sed \"s/'/''/g\")
+          sname=\$(echo \"\$name\" | sed \"s/'/''/g\")
+          svalue=\$(echo \"\$value\" | sed \"s/'/''/g\")
+          sqlite3 '$cdb' \"INSERT OR REPLACE INTO cookies (host_key, name, value, expires_utc, last_access_utc, creation_utc, path, is_secure, is_httponly, has_expires, is_persistent) VALUES ('\$shost', '\$sname', '\$svalue', \${expiry:-0}, 0, 0, '/', 1, 0, 1, 1);\" 2>/dev/null || true
+          echo restored:\$host
+        done < ${PRESERVE_DIR}/preserved.tsv"
+        echo "$(TS) INFO Login cookies restored via sqlite3"
+        return 0
+      fi
+    fi
+  fi
+
+  if sh_dev "test -s ${PRESERVE_DIR}/Cookies.bak && echo yes" | grep -q yes; then
+    sh_dev "mkdir -p ${CHROME_DATA_DIR}/app_chrome/Default/Network ${CHROME_DATA_DIR}/app_chrome/Default" || true
+    target="$COOKIE_DB_PRIMARY"
+    sh_dev "cp -f ${PRESERVE_DIR}/Cookies.bak '$target'" || \
+      sh_dev "su -c 'cp -f ${PRESERVE_DIR}/Cookies.bak \"$target\"'" || \
+      sh_dev "cp -f ${PRESERVE_DIR}/Cookies.bak '$COOKIE_DB_SECONDARY'" || true
+    echo "$(TS) INFO Login cookies restored via full DB file copy"
+    return 0
+  fi
+  echo "$(TS) INFO nothing to restore"
+}
+
 wipe_chrome_data() {
-    echo "$(TS) INFO Wiping Chrome data preserving login cookies..."
-    
-    # Preserve one cookie per domain before clearing
-    /system/bin/adb shell "mkdir -p /tmp/cookies_preserve 2>/dev/null" || true
-    
-    if /system/bin/adb shell "test -f ${CHROME_DATA_DIR}/Default/Cookies" 2>/dev/null; then
-        /system/bin/adb shell "sqlite3 -separator '|' ${CHROME_DATA_DIR}/Default/Cookies \
-            'SELECT host, name, value, expiry, lastAccessTime FROM cookies' \
-            > /tmp/cookies_preserve/all_cookies.txt 2>/dev/null" || true
-        
-        if [ -s /tmp/cookies_preserve/all_cookies.txt ]; then
-            /system/bin/adb shell "sqlite3 /tmp/cookies_preserve/preserved.db \
-                'CREATE TABLE IF NOT EXISTS cookies (host TEXT, name TEXT, value TEXT, expiry INTEGER);' 2>/dev/null || true"
-            
-            # Get unique domains and preserve one cookie each (most recently accessed)
-            domains=$(/system/bin/adb shell "sqlite3 -separator '|' ${CHROME_DATA_DIR}/Default/Cookies \
-                'SELECT DISTINCT host FROM cookies' 2>/dev/null" | tr '\n' ' ') || true
-            
-            preserved_count=0
-            for d in $domains; do
-                [ -z "$d" ] && continue
-                cookie_info=$(/system/bin/adb shell "sqlite3 -separator '|' ${CHROME_DATA_DIR}/Default/Cookies \
-                    'SELECT host, name, value, expiry, lastAccessTime FROM cookies WHERE host = '${d}' ORDER BY lastAccessTime DESC LIMIT 1' 2>/dev/null") || true
-                
-                if [ -n "$cookie_info" ]; then
-                    set -- $cookie_info
-                    safe_host=$(echo "$1" | sed "s/'/''/g")
-                    safe_name=$(echo "$2" | sed "s/'/''/g")
-                    safe_value=$(echo "$3" | sed "s/'/''/g")
-                    
-                    /system/bin/adb shell "sqlite3 /tmp/cookies_preserve/preserved.db \
-                        \"INSERT OR REPLACE INTO cookies (host, name, value, expiry) VALUES ('${safe_host}', '${safe_name}', '${safe_value}', ${4});\" 2>/dev/null || true"
-                    
-                    preserved_count=$((preserved_count + 1))
-                    echo "$(TS) INFO Preserved cookie for: ${safe_host}"
-                fi
-            done
-            echo "$(TS) INFO Preserved ${preserved_count} cookies total (one per domain)"
-        fi
-    fi
-    
-    # Clear all Chrome data (pm clear deletes all cookies, cache, site data)
-    /system/bin/adb shell "pm clear ${GOOGLE_CHROME_PACKAGE}" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf ${CHROME_DATA_DIR}" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/data/${GOOGLE_CHROME_PACKAGE}/cache" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/data/${GOOGLE_CHROME_PACKAGE}/app_chrome*" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/data/${GOOGLE_CHROME_PACKAGE}/File/*" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/data/${GOOGLE_CHROME_PACKAGE}/GPUCache" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/data/${GOOGLE_CHROME_PACKAGE}/Media*Cache*" 2>/dev/null || true
-    
-    # Restore preserved login cookies
-    if [ -f /tmp/cookies_preserve/preserved.db ] && [ "$preserved_count" -gt 0 ]; then
-        preserved_hosts=$(/system/bin/adb shell "sqlite3 /tmp/cookies_preserve/preserved.db 'SELECT host FROM cookies' 2>/dev/null" | tr '\n' ' ') || true
-        for host in $preserved_hosts; do
-            [ -z "$host" ] && continue
-            cookie_data=$(/system/bin/adb shell "sqlite3 /tmp/cookies_preserve/preserved.db \
-                'SELECT name, value, expiry FROM cookies WHERE host = '${host};' 2>/dev/null") || true
-            if [ -n "$cookie_data" ]; then
-                set -- $cookie_data
-                r_name="$1"
-                r_value="$2"
-                r_expiry="$3"
-                safe_host=$(echo "$host" | sed "s/'/''/g")
-                safe_name=$(echo "$r_name" | sed "s/'/''/g")
-                safe_value=$(echo "$r_value" | sed "s/'/''/g")
-                /system/bin/adb shell "sqlite3 ${CHROME_DATA_DIR}/Default/Cookies \
-                    \"INSERT OR REPLACE INTO cookies (host, name, value, expiry, lastAccessTime, creationTime) \
-                    VALUES ('${safe_host}', '${safe_name}', '${safe_value}', ${r_expiry}, $(/system/bin/adb shell "date +%s" 2>/dev/null), $(/system/bin/adb shell "date +%s" 2>/dev/null));\" 2>/dev/null || true"
-                echo "$(TS) INFO Restored cookie for: ${host}"
-            fi
-        done
-        echo "$(TS) INFO Login cookies restored for persistent login state"
-    fi
-    
-    echo "$(TS) INFO Chrome data wipe complete"
+  echo "$(TS) INFO Wiping Chrome data preserving login cookies..."
+  preserve_login_cookies
+  sh_dev "am force-stop ${GOOGLE_CHROME_PACKAGE}" || true
+  if sh_dev "pm clear ${GOOGLE_CHROME_PACKAGE}"; then
+    echo "$(TS) INFO pm clear ${GOOGLE_CHROME_PACKAGE} ok"
+  else
+    echo "$(TS) WARN pm clear chrome failed; manual wipe"
+    sh_dev "rm -rf ${CHROME_DATA_DIR}/cache ${CHROME_DATA_DIR}/code_cache ${CHROME_DATA_DIR}/app_chrome ${CHROME_DATA_DIR}/app_tabs" || true
+  fi
+  sh_dev "rm -rf ${CHROME_DATA_DIR}/cache \
+                 ${CHROME_DATA_DIR}/code_cache \
+                 '${CHROME_DATA_DIR}/app_chrome/Default/Cache' \
+                 '${CHROME_DATA_DIR}/app_chrome/Default/Code Cache' \
+                 '${CHROME_DATA_DIR}/app_chrome/Default/GPUCache' \
+                 '${CHROME_DATA_DIR}/app_chrome/Default/Media Cache' \
+                 '${CHROME_DATA_DIR}/app_chrome/Default/Service Worker' \
+                 ${CHROME_DATA_DIR}/app_tabs \
+                 /sdcard/Android/data/${GOOGLE_CHROME_PACKAGE}/cache" || true
+  restore_login_cookies
+  echo "$(TS) INFO Chrome data wipe complete"
 }
 
-# Wipe Google account data (GMS, auth tokens, etc.)
+# GMS cache-only — never pm clear (keeps Google account login)
 wipe_google_account() {
-    echo "$(TS) INFO Wiping Google account data..."
-    /system/bin/adb shell "pm clear ${GOOGLE_ACCOUNTS_PACKAGE}" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf ${GOOGLE_GMS_DIR}/cache" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf ${GOOGLE_GMS_DIR}/databases" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/misc/credentials/*" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/misc/user/0/com.google/*" 2>/dev/null || true
-    echo "$(TS) INFO Google account data wipe complete"
+  echo "$(TS) INFO Wiping GMS caches (account login preserved)..."
+  for pkg in ${GOOGLE_ACCOUNTS_PACKAGE} \
+             com.google.android.gsf \
+             com.google.android.gsf.login \
+             com.google.android.googlequicksearchbox \
+             com.google.android.gm \
+             com.google.android.apps.maps \
+             com.google.android.youtube \
+             com.google.android.apps.photos
+  do
+    sh_dev "rm -rf /data/data/${pkg}/cache /data/data/${pkg}/code_cache \
+                   /sdcard/Android/data/${pkg}/cache" || true
+    sh_dev "su -c 'rm -rf /data/data/${pkg}/cache /data/data/${pkg}/code_cache'" || true
+  done
+  echo "$(TS) INFO GMS cache wipe complete"
 }
 
-# Wipe non-Google app cache (specify apps: e.g., NON_GOOGLE_APPS="app1 app2")
-wipe_non_google_cache() {
-    echo "$(TS) INFO Wiping non-Google app cache..."
-    if [ -n "${NON_GOOGLE_APPS}" ]; then
-        for app in ${NON_GOOGLE_APPS}; do
-            if /system/bin/adb shell "pm list packages -e | grep -q ${app}" 2>/dev/null; then
-                echo "$(TS) INFO Cleaning: ${app}"
-                /system/bin/adb shell "pm clear ${app}" 2>/dev/null || true
-                /system/bin/adb shell "rm -rf /data/data/${app}/cache" 2>/dev/null || true
-                /system/bin/adb shell "rm -rf /data/data/${app}/app_compat*" 2>/dev/null || true
-            else
-                echo "$(TS) WARN App not found: ${app}"
-            fi
-        done
-    else
-        echo "$(TS) INFO No non-Google apps specified, skipping"
-    fi
-    echo "$(TS) INFO Non-Google app cache cleanup complete"
+wipe_all_app_caches() {
+  echo "$(TS) INFO Wiping caches for all apps..."
+  # Works without root: Package Manager free-cache request
+  sh_dev "pm trim-caches 128G" || sh_dev "cmd package trim-caches 128G" || \
+    echo "$(TS) WARN trim-caches unavailable"
+
+  if [ -n "${NON_GOOGLE_APPS}" ]; then
+    for app in ${NON_GOOGLE_APPS}; do
+      echo "$(TS) INFO Cleaning listed app: ${app}"
+      sh_dev "rm -rf /data/data/${app}/cache /data/data/${app}/code_cache" || true
+      sh_dev "rm -rf /sdcard/Android/data/${app}/cache" || true
+    done
+  fi
+
+  # Root: sweep every app cache
+  sh_dev "su -c 'for d in /data/data/*/cache /data/data/*/code_cache; do [ -d \"\$d\" ] && rm -rf \"\$d\"/*; done'" || true
+  # Non-root external caches
+  sh_dev "rm -rf /sdcard/Android/data/*/cache/* /storage/emulated/0/Android/data/*/cache/*" || true
+  echo "$(TS) INFO All-app cache cleanup complete"
 }
 
-# Clean artifacts and bloat (expanded scope)
+wipe_temp_dirs() {
+  echo "$(TS) INFO Wiping temp dirs..."
+  # Preserve cleanup tooling under /data/local/tmp
+  sh_dev 'for p in /data/local/tmp/*; do
+    [ -e "$p" ] || continue
+    base=$(basename "$p")
+    case "$base" in
+      pixel_cleanup.log|pixel_cleanup.lock|pixel_cleanup_ondevice.sh|\
+      chrome_monitor.log|chrome_monitor.sh|chrome_monitor_state|chrome_monitor.pid|\
+      cookies_preserve) ;;
+      *) rm -rf "$p" ;;
+    esac
+  done' || true
+  sh_dev "rm -rf /cache/* /data/local/tmp/dalvik-cache" || true
+  sh_dev "su -c 'rm -rf /cache/* /data/cache/* /data/system/cache/* /data/tombstones/* /data/anr/*'" || true
+  sh_dev "rm -rf /sdcard/.temp /sdcard/temp /sdcard/tmp /storage/emulated/0/.temp" || true
+  sh_dev "find /sdcard -maxdepth 3 -name '*.tmp' -type f -delete" || true
+  echo "$(TS) INFO Temp dirs wipe complete"
+}
+
 clean_artifacts() {
-    echo "$(TS) INFO Cleaning artifacts and bloat..."
-    /system/bin/adb shell "rm -rf /cache/*" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/local/tmp/*" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /storage/emulated/0/Download/*" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/system/cache/*" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/uicc/*" 2>/dev/null || true
-    WEBSITE_PKG="org.chromium.webview"
-    if /system/bin/adb shell "pm list packages -e | grep -q ${WEBSITE_PKG}" 2>/dev/null; then
-        /system/bin/adb shell "pm clear ${WEBSITE_PKG}" 2>/dev/null || true
-        /system/bin/adb shell "rm -rf /data/data/${WEBSITE_PACKAGE}/cache" 2>/dev/null || true
-    fi
-    /system/bin/adb shell "find /data -maxdepth 3 -name '*.cache' -type f -delete" 2>/dev/null || true
-    /system/bin/adb shell "find /data -maxdepth 3 -name '*.log' -type f -delete" 2>/dev/null || true
-    /system/bin/adb shell "find /data/media/0 -name '*.thumbnail' -type f -delete" 2>/dev/null || true
-    /system/bin/adb shell "find /data/media/0 -maxdepth 2 -name '*.jpg' -type f -mtime +30 -delete" 2>/dev/null || true
-    /system/bin/adb shell "find /data/media/0 -maxdepth 2 -name '*.png' -type f -mtime +30 -delete" 2>/dev/null || true
-    echo "$(TS) INFO Artifacts cleanup complete"
+  echo "$(TS) INFO Cleaning artifacts and bloat..."
+  wipe_temp_dirs
+  sh_dev "find /sdcard/Download -type f -mtime +7 -delete" || true
+  sh_dev "find /storage/emulated/0/Download -type f -mtime +7 -delete" || true
+  sh_dev "rm -rf /sdcard/DCIM/.thumbnails /storage/emulated/0/DCIM/.thumbnails" || true
+  for wp in com.google.android.webview com.android.webview org.chromium.webview; do
+    sh_dev "rm -rf /data/data/${wp}/cache /data/data/${wp}/code_cache" || true
+  done
+  echo "$(TS) INFO Artifacts cleanup complete"
 }
 
-# Optimize phone performance (expanded scope)
 optimize_phone() {
-    echo "$(TS) INFO Optimizing phone performance..."
-    /system/bin/adb shell "sync" 2>/dev/null || true
-    /system/bin/adb shell "echo 'powersave' > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/dalvik-cache/*" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/data/*/cache/*" 2>/dev/null || true
-    /system/bin/adb shell "echo 3 > /proc/sys/vm/drop_caches" 2>/dev/null || true
-    /system/bin/adb shell "rm -rf /data/data/*/code_cache/*" 2>/dev/null || true
-    /system/bin/adb shell "find /data/data -maxdepth 2 -name '*.tmp' -type f -delete" 2>/dev/null || true
-    /system/bin/adb shell "resetstats" 2>/dev/null || true
-    echo "$(TS) INFO Performance optimization complete"
+  echo "$(TS) INFO Optimizing phone performance..."
+  sh_dev "sync" || true
+  sh_dev "su -c 'echo 3 > /proc/sys/vm/drop_caches'" || \
+    sh_dev "echo 3 > /proc/sys/vm/drop_caches" || true
+  sh_dev "su -c 'rm -rf /data/dalvik-cache/*'" || \
+    sh_dev "rm -rf /data/dalvik-cache/*" || true
+  echo "$(TS) INFO Performance optimization complete"
 }
 
-# Main function - orchestrates all cleanup
 main() {
-    echo "$(TS) INFO === pixel_cleanup.sh starting ==="
-    
-    # Check Chrome status - requires ADB connection
-    if is_chrome_running; then
-        echo "$(TS) INFO Chrome is running - no cleanup needed at this time"
-    else
-        echo "$(TS) INFO Chrome is not active - initiating full cleanup..."
-        wipe_chrome_data
-        wipe_google_account
-        wipe_non_google_cache
-        clean_artifacts
-        optimize_phone
-    fi
-    
-    echo "$(TS) INFO === pixel_cleanup.sh complete ==="
+  echo "$(TS) INFO === pixel_cleanup.sh starting ==="
+  case "$1" in
+    --force) force=1 ;;
+    *) force=0 ;;
+  esac
+  if [ "$force" -eq 0 ] && is_chrome_running; then
+    echo "$(TS) INFO Chrome is running - no cleanup needed at this time"
+  else
+    echo "$(TS) INFO Initiating full cleanup (Chrome + all-app caches + temp dirs)..."
+    wipe_chrome_data
+    wipe_google_account
+    wipe_all_app_caches
+    clean_artifacts
+    optimize_phone
+  fi
+  echo "$(TS) INFO === pixel_cleanup.sh complete ==="
 }
 
-# Run main
 main "$@"
